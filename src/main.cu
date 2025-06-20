@@ -307,7 +307,7 @@ int main() {
 
     float input_h[]    = {0,0,0,1,1,0,1,1};
     float expected_h[] = {0,0,0,1};
-    float learningRate = 1e-1;
+    float learningRate = 1;
     cudaMemcpy(input, input_h, sizeof(input_h), cudaMemcpyHostToDevice);
     cudaMemcpy(expected, expected_h, sizeof(expected_h), cudaMemcpyHostToDevice);
 
