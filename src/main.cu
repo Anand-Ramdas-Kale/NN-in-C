@@ -77,6 +77,50 @@ void nn_random(NN *nn, float low, float high) {
     free(A);
 }
 
+void nn_forward(NN *nn, float *input, float *activations, cublasHandle_t handle) {
+    uint32_t *neurons  = nn->neurons;
+    uint32_t layers    = nn->layers;
+    float**  weights   = (float **)(nn->weights);
+    float**  biases    = (float **)(nn->biases);
+
+    float *previous_activations;
+    float *next_activations = activations;
+    const float alpha  = 1.0f;
+    const float beta   = 1.0f;
+
+    uint32_t rows  = neurons[1];
+    uint32_t cols  = neurons[0];
+    previous_activations = input;
+    next_activations     = activations;
+    uint64_t total       = ((uint64_t)nn->mem_limit - (uint64_t)nn->biases[0]);
+    cudaMemcpy(next_activations, biases[0], total, cudaMemcpyDeviceToDevice);
+    // I am not checking the return status, if this fails, everything should ... same in loop
+    cublasSgemv(handle, CUBLAS_OP_N,
+                rows, cols,
+                &alpha,
+                weights[0], rows,
+                previous_activations, 1,
+                &beta,
+                next_activations, 1);
+    sigmoid_kernel<<<rows>>>(next_activations, rows);
+
+    for (uint32_t layer = 1; layer < layers; ++layer) {
+        uint32_t rows  = neurons[layer + 1];
+        uint32_t cols  = neurons[layer];
+        previous_activations = next_activations;
+        next_activations     = previous_activations + cols;
+        // I am not checking the return status, if this fails, everything should ...
+        cublasSgemv(handle, CUBLAS_OP_N,
+                    rows, cols,
+                    &alpha,
+                    weights[layer], rows,
+                    previous_activations, 1,
+                    &beta,
+                    next_activations, 1);
+        sigmoid_kernel<<<rows>>>(next_activations, rows);
+    }
+}
+
 void nn_print(NN *nn) {
     // completely unoptimized
     uint32_t layers = nn->layers;
