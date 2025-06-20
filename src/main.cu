@@ -26,6 +26,30 @@ __global__ void sigmoid_kernel(float *V, int n) {
     }
 }
 
+__global__ void add_kernel(float alpha, const float *A, float *B, uint32_t n) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < n) {
+        B[index] = alpha * A[index] + B[index];
+    }
+}
+__global__ void nn_last_layer_grad_b(float *Y, float *A, uint32_t n) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < n) {
+        float a = A[index];
+        float y = Y[index];
+        A[index] = (2.f / n) * a * (1 - a) * (a - y);
+    }
+}
+
+__global__ void update_a2grad_b(const float *scratch_buffer, float *A, uint32_t n) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < n) {
+        float a = A[index];
+        float b = scratch_buffer[index];
+        A[index] = a * (1 - a) * b;
+    }
+}
+
 NN *nn_create(const uint32_t *arch, const uint32_t size) {
     // first layer is input layer, it has no biases
     // it is not counted in layers of structure
@@ -88,8 +112,8 @@ void nn_forward(NN *nn, float *input, float *activations, cublasHandle_t handle)
     const float alpha  = 1.0f;
     const float beta   = 1.0f;
 
-    uint32_t rows  = neurons[1];
-    uint32_t cols  = neurons[0];
+    const uint32_t rows  = neurons[1];
+    const uint32_t cols  = neurons[0];
     previous_activations = input;
     next_activations     = activations;
     uint64_t total       = ((uint64_t)nn->mem_limit - (uint64_t)nn->biases[0]);
@@ -121,6 +145,66 @@ void nn_forward(NN *nn, float *input, float *activations, cublasHandle_t handle)
     }
 }
 
+void nn_learn(NN *nn, float *activations, float *input, float *expected,
+              float *scratch_buffer, float learningRate, cublasHandle_t handle)
+{
+    uint32_t* neurons = (uint32_t *) (nn->neurons);
+    float**   weights = (float **  ) (nn->weights);
+    float**   biases  = (float **  ) (nn->biases );
+    uint32_t   layers = (uint32_t  ) (nn->layers );
+    uint64_t   size_b = (uint64_t  ) (((uint64_t) (nn->mem_limit) - (uint64_t) (biases[0])) >> 2);
+    // last layer:
+    uint32_t coverd = neurons[layers];
+    float* gradB    = activations + size_b - coverd;
+    nn_last_layer_grad_b<<<coverd>>>(expected, gradB, coverd);
+
+    // back propogation:
+    float alpha = 1.f;
+    float beta  = 1.f;
+    float rate  = -1 * learningRate;
+
+    for (int layer = layers - 1; layer > 0; --layer) {
+        uint32_t cols = neurons[layer - 1];
+        uint32_t rows = neurons[layer]    ;
+
+        // partial C by partial a for previous layer in scratch_buffer
+        cublasSgemv(handle, CUBLAS_OP_T,
+                    cols, rows,
+                    &alpha,
+                    weights[layer], rows,
+                    gradB, 1,
+                    &beta,
+                    scratch_buffer, 1);
+
+        // update weights[layer] now
+        cublasSgemm(handle,
+                    CUBLAS_OP_N, CUBLAS_OP_N,
+                    rows, cols, 1,
+                    &rate,
+                    gradB, rows,
+                    gradB - cols, 1,
+                    &beta,
+                    weights[layer], rows);
+
+        // use scratch buffer to update previous activations to grad b
+        gradB = gradB - cols;
+        update_a2grad_b<<<cols>>>(scratch_buffer, gradB, cols);
+    }
+
+    // update the zeroth weight matrix
+    uint32_t rows = neurons[1];
+    uint32_t cols = neurons[0];
+    cublasSgemm(handle,
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                rows, cols, 1,
+                &rate,
+                gradB, rows,
+                input, 1,
+                &beta,
+                weights[0], rows);
+    add_kernel<<<size_b>>>(rate, gradB, biases[0], size_b);
+}
+
 void nn_print(NN *nn) {
     // completely unoptimized
     uint32_t layers = nn->layers;
@@ -150,7 +234,7 @@ void nn_print(NN *nn) {
 
 void nn_destroy(NN *nn) {
     if (nn) {
-        cudaFree(nn->weights);
+        cudaFree(nn->weights[0]);
         free(nn);
     }
 }
@@ -203,12 +287,71 @@ int main() {
 
 // --------------------------------------------------------------------------------------------------------//
     // NN functions rough
-    uint32_t a[] = {5,3,4,4,10};
-    NN *nn = nn_create(a, sizeof(a) / sizeof(a[0]));
-    for (int i = 0; i < nn->layers; ++i) {
-        printf("%zu %zu\n", nn->weights[i], nn->biases[i]);
+    uint32_t a[] = {2,1};
+    uint32_t mid = 0;
+    uint64_t sz  = sizeof(a) / sizeof(a[0]);
+    for (int i = 1; i < sz - 1; ++i) {
+        mid += a[i];
     }
-    nn_random(nn, 0, 1);
+    NN *nn = nn_create(a, sz);
+
+    float *input;
+    float *expected;
+    float *activations;
+    float *scratch_buffer;
+    
+    cudaMalloc(&input, sizeof(float) * 8);
+    cudaMalloc(&expected, sizeof(float) * 4);
+    cudaMalloc(&activations, sizeof(float) * 8);
+    cudaMalloc(&scratch_buffer, sizeof(float) * 8);
+
+    float input_h[]    = {0,0,0,1,1,0,1,1};
+    float expected_h[] = {0,0,0,1};
+    float learningRate = 1e-1;
+    cudaMemcpy(input, input_h, sizeof(input_h), cudaMemcpyHostToDevice);
+    cudaMemcpy(expected, expected_h, sizeof(expected_h), cudaMemcpyHostToDevice);
+
+    /*
+    float *biases = (float *)nn->biases[0];
+    float biases_h[3];
+    biases_h[0] = 4.41;
+    biases_h[1] = -0.04;
+    biases_h[2] = -17.28;
+    cudaMemcpy(biases, biases_h, 3 * sizeof(float), cudaMemcpyHostToDevice);
+
+    float *weights = (float *)nn->weights[0];
+    float weights_h[6];
+    weights_h[0] = -1.53;
+    weights_h[1] = 3.49;
+    weights_h[2] = -3.07;
+    weights_h[3] = 1.53;
+    weights_h[4] = 4.41;
+    weights_h[5] = -0.04;
+    cudaMemcpy(weights, weights_h, sizeof(weights_h), cudaMemcpyHostToDevice);
+    */
+    nn_random(nn, -5, 5);
+
+    nn_print(nn);
+    for (int i = 0; i < 1000 * 25; ++i) {
+        float c = 0.f;
+        float result = 0;
+        for (int k = 0; k < 10; ++k) {
+            for (int j = 0; j < 4; ++j) {
+                nn_forward(nn, input + (j << 1), activations, handle);
+                cudaMemcpy(&result, activations + mid, sizeof(float), cudaMemcpyDeviceToHost);
+                c += (expected_h[j] - result) * (expected_h[j] - result);
+                nn_learn(nn, activations, input + (j << 1), expected + j, scratch_buffer, learningRate, handle);
+            }
+        }
+        printf("cost = %f\n", c / 40);
+    }
+    for (int j = 0; j < 4; ++j) {
+        float result = 0;
+        nn_forward(nn, input + (j << 1), activations, handle);
+        cudaMemcpy(&result, activations + mid, sizeof(float), cudaMemcpyDeviceToHost);
+        printf("%.2f | %.2f = %.2f\n", input_h[j << 1], input_h[(j << 1) + 1], result);
+    }
+
     nn_print(nn);
     nn_destroy(nn);
     cublasDestroy(handle);
