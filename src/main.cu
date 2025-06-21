@@ -109,8 +109,7 @@ void nn_forward(NN *nn, float *input, float *activations, cublasHandle_t handle)
 
     float *previous_activations;
     float *next_activations = activations;
-    const float alpha  = 1.0f;
-    const float beta   = 1.0f;
+    const float one  = 1.0f;
 
     const uint32_t rows  = neurons[1];
     const uint32_t cols  = neurons[0];
@@ -121,10 +120,10 @@ void nn_forward(NN *nn, float *input, float *activations, cublasHandle_t handle)
     // I am not checking the return status, if this fails, everything should ... same in loop
     cublasSgemv(handle, CUBLAS_OP_N,
                 rows, cols,
-                &alpha,
+                &one,
                 weights[0], rows,
                 previous_activations, 1,
-                &beta,
+                &one,
                 next_activations, 1);
     sigmoid_kernel<<<rows>>>(next_activations, rows);
 
@@ -136,10 +135,10 @@ void nn_forward(NN *nn, float *input, float *activations, cublasHandle_t handle)
         // I am not checking the return status, if this fails, everything should ...
         cublasSgemv(handle, CUBLAS_OP_N,
                     rows, cols,
-                    &alpha,
+                    &one,
                     weights[layer], rows,
                     previous_activations, 1,
-                    &beta,
+                    &one,
                     next_activations, 1);
         sigmoid_kernel<<<rows>>>(next_activations, rows);
     }
@@ -159,31 +158,31 @@ void nn_learn(NN *nn, float *activations, float *input, float *expected,
     nn_last_layer_grad_b<<<coverd>>>(expected, gradB, coverd);
 
     // back propogation:
-    float alpha = 1.f;
-    float beta  = 1.f;
-    float rate  = -1 * learningRate;
+    float one  = 1.f;
+    float zero = 0.f;
+    float rate = -1 * learningRate;
 
     for (int layer = layers - 1; layer > 0; --layer) {
         uint32_t cols = neurons[layer - 1];
         uint32_t rows = neurons[layer]    ;
-
+        // add_kernel<<< (rows + 255) / 256, 256 >>>(rate, gradB, biases[layer], rows);
         // partial C by partial a for previous layer in scratch_buffer
         cublasSgemv(handle, CUBLAS_OP_T,
                     cols, rows,
-                    &alpha,
+                    &one,
                     weights[layer], rows,
                     gradB, 1,
-                    &beta,
+                    &zero,
                     scratch_buffer, 1);
 
         // update weights[layer] now
         cublasSgemm(handle,
-                    CUBLAS_OP_N, CUBLAS_OP_N,
+                    CUBLAS_OP_N, CUBLAS_OP_T,
                     rows, cols, 1,
                     &rate,
                     gradB, rows,
-                    gradB - cols, 1,
-                    &beta,
+                    gradB - cols, cols,
+                    &one,
                     weights[layer], rows);
 
         // use scratch buffer to update previous activations to grad b
@@ -195,12 +194,12 @@ void nn_learn(NN *nn, float *activations, float *input, float *expected,
     uint32_t rows = neurons[1];
     uint32_t cols = neurons[0];
     cublasSgemm(handle,
-                CUBLAS_OP_N, CUBLAS_OP_N,
+                CUBLAS_OP_N, CUBLAS_OP_T,
                 rows, cols, 1,
                 &rate,
                 gradB, rows,
-                input, 1,
-                &beta,
+                input, cols,
+                &one,
                 weights[0], rows);
     add_kernel<<<size_b>>>(rate, gradB, biases[0], size_b);
 }
@@ -329,7 +328,7 @@ int main() {
     weights_h[5] = -0.04;
     cudaMemcpy(weights, weights_h, sizeof(weights_h), cudaMemcpyHostToDevice);
     */
-    nn_random(nn, -5, 5);
+    nn_random(nn, -0.2, 0.2);
 
     nn_print(nn);
     for (int i = 0; i < 1000 * 25; ++i) {
