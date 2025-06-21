@@ -50,6 +50,28 @@ __global__ void update_a2grad_b(const float *scratch_buffer, float *A, uint32_t 
     }
 }
 
+// Leaky ReLU activation function
+__global__ void leaky_relu_kernel(float *V, int n) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < n) {
+        // You can also use fmaxf(0.01f * V[index], V[index])
+        if (V[index] < 0) {
+            V[index] *= 0.01f;
+        }
+    }
+}
+
+// Derivative of Leaky ReLU for backpropagation.
+// This replaces your update_a2grad_b_relu kernel.
+__global__ void update_a2grad_b_leaky_relu(const float *incoming_grad, float *activations, uint32_t n) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < n) {
+        // Derivative is 1 if activation was > 0, else it's 0.01.
+        float derivative = (activations[index] > 0.0f) ? 1.0f : 0.01f;
+        activations[index] = incoming_grad[index] * derivative;
+    }
+}
+
 NN *nn_create(const uint32_t *arch, const uint32_t size) {
     // first layer is input layer, it has no biases
     // it is not counted in layers of structure
@@ -125,7 +147,7 @@ void nn_forward(NN *nn, float *input, float *activations, cublasHandle_t handle)
                 previous_activations, 1,
                 &one,
                 next_activations, 1);
-    sigmoid_kernel<<<rows>>>(next_activations, rows);
+    leaky_relu_kernel<<<rows>>>(next_activations, rows);
 
     for (uint32_t layer = 1; layer < layers; ++layer) {
         uint32_t rows  = neurons[layer + 1];
@@ -140,7 +162,7 @@ void nn_forward(NN *nn, float *input, float *activations, cublasHandle_t handle)
                     previous_activations, 1,
                     &one,
                     next_activations, 1);
-        sigmoid_kernel<<<rows>>>(next_activations, rows);
+        leaky_relu_kernel<<<rows>>>(next_activations, rows);
     }
 }
 
@@ -187,7 +209,7 @@ void nn_learn(NN *nn, float *activations, float *input, float *expected,
 
         // use scratch buffer to update previous activations to grad b
         gradB = gradB - cols;
-        update_a2grad_b<<<cols>>>(scratch_buffer, gradB, cols);
+        update_a2grad_b_leaky_relu<<<cols>>>(scratch_buffer, gradB, cols);
     }
 
     // update the zeroth weight matrix
@@ -211,7 +233,7 @@ void nn_print(NN *nn) {
     uint64_t total = ((uint64_t)(nn->mem_limit) - (uint64_t)(nn->weights[0]));
     float *A = (float *)malloc(total);
     float *W = A;
-    float *B = A + (((uint64_t)(nn->biases) - (uint64_t)(nn->weights)) >> 2);
+    float *B = A + (((uint64_t)(nn->biases[0]) - (uint64_t)(nn->weights[0])) >> 2);
     cudaMemcpy(A, *(nn->weights), total, cudaMemcpyDeviceToHost);
 
     printf("\n");
@@ -286,13 +308,14 @@ int main() {
 
 // --------------------------------------------------------------------------------------------------------//
     // NN functions rough
-    uint32_t a[] = {2,1};
+    uint32_t a[] = {2,2,1};
     uint32_t mid = 0;
     uint64_t sz  = sizeof(a) / sizeof(a[0]);
     for (int i = 1; i < sz - 1; ++i) {
         mid += a[i];
     }
     NN *nn = nn_create(a, sz);
+    nn_random(nn, -1, 1);
 
     float *input;
     float *expected;
@@ -301,48 +324,37 @@ int main() {
     
     cudaMalloc(&input, sizeof(float) * 8);
     cudaMalloc(&expected, sizeof(float) * 4);
-    cudaMalloc(&activations, sizeof(float) * 8);
+    cudaMalloc(&activations, sizeof(float) * 4);
     cudaMalloc(&scratch_buffer, sizeof(float) * 8);
 
     float input_h[]    = {0,0,0,1,1,0,1,1};
-    float expected_h[] = {0,0,0,1};
-    float learningRate = 1;
+    float expected_h[] = {1,0,0,1};
+    float learningRate = 1e-1;
+    // float exact_set[ ] = {20, -20, 20, -20, 20, 20, -10, 30, -30};
     cudaMemcpy(input, input_h, sizeof(input_h), cudaMemcpyHostToDevice);
     cudaMemcpy(expected, expected_h, sizeof(expected_h), cudaMemcpyHostToDevice);
-
-    /*
-    float *biases = (float *)nn->biases[0];
-    float biases_h[3];
-    biases_h[0] = 4.41;
-    biases_h[1] = -0.04;
-    biases_h[2] = -17.28;
-    cudaMemcpy(biases, biases_h, 3 * sizeof(float), cudaMemcpyHostToDevice);
-
-    float *weights = (float *)nn->weights[0];
-    float weights_h[6];
-    weights_h[0] = -1.53;
-    weights_h[1] = 3.49;
-    weights_h[2] = -3.07;
-    weights_h[3] = 1.53;
-    weights_h[4] = 4.41;
-    weights_h[5] = -0.04;
-    cudaMemcpy(weights, weights_h, sizeof(weights_h), cudaMemcpyHostToDevice);
-    */
-    nn_random(nn, -0.2, 0.2);
+    // cudaMemcpy(nn->weights[0], exact_set, sizeof(exact_set), cudaMemcpyHostToDevice);
 
     nn_print(nn);
-    for (int i = 0; i < 1000 * 25; ++i) {
-        float c = 0.f;
-        float result = 0;
-        for (int k = 0; k < 10; ++k) {
-            for (int j = 0; j < 4; ++j) {
-                nn_forward(nn, input + (j << 1), activations, handle);
-                cudaMemcpy(&result, activations + mid, sizeof(float), cudaMemcpyDeviceToHost);
-                c += (expected_h[j] - result) * (expected_h[j] - result);
-                nn_learn(nn, activations, input + (j << 1), expected + j, scratch_buffer, learningRate, handle);
-            }
+    nn_forward(nn, input, activations, handle);
+    // float result = 0;
+    // cudaMemcpy(&result, activations + mid, sizeof(float), cudaMemcpyDeviceToHost);
+    // current_cost += (expected_h[j] - result) * (expected_h[j] - result);
+    nn_learn(nn, activations, input, expected, scratch_buffer, learningRate, handle);
+    nn_print(nn);
+    int epochs = 100 * 1000;
+    for (int i = 0; i < epochs; ++i) {
+        float current_cost = 0.f;
+        for (int j = 0; j < 4; ++j) {
+            nn_forward(nn, input + (j << 1), activations, handle);
+            float result = 0;
+            cudaMemcpy(&result, activations + mid, sizeof(float), cudaMemcpyDeviceToHost);
+            current_cost += (expected_h[j] - result) * (expected_h[j] - result);
+            nn_learn(nn, activations, input + (j << 1), expected + j, scratch_buffer, learningRate, handle);
         }
-        printf("cost = %f\n", c / 40);
+        if (i % 1000 == 0) {
+            printf("epoch %d: cost = %f\n", i, current_cost / 4.0f);
+        }
     }
     for (int j = 0; j < 4; ++j) {
         float result = 0;
